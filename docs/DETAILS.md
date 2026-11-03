@@ -303,11 +303,18 @@ still apply to what reaches it:
 
 - **Model settings in the web page.** The About tab's Model settings card shows and changes a few config keys:
   the `sampling` defaults, `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`,
-  `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s` and `api_monitor`. The earlier file is kept as
-  `strata-cached.json.bak`, and the model uses the change from its next start.
+  `aliases`, `idle_unload_s`, `lazy_load`, `idle_exit_s`, `engine_silence_s` and `api_monitor`. The earlier file is
+  kept as `strata-cached.json.bak`, and the model uses the change from its next start.
 - **Start the API without loading the model:** `serve/server.py ... --lazy` (or `"lazy_load": true`). The first
   generation request, or `POST /load`, loads the engine; `POST /unload` stops it. `"idle_unload_s": N` unloads
   the model after N seconds without requests.
+- **macOS: start the server on demand:** `--launchd-socket NAME` (or `"launchd_socket": "NAME"`) serves the
+  listening socket of a launchd job's `Sockets` entry NAME instead of binding the port, and `"idle_exit_s": N` (or
+  `--idle-exit N`) stops the whole server after N seconds without requests. launchd keeps the port open while the
+  server is stopped and starts it at the next connection (about 1 s, then the model loads as with `lazy_load`), so
+  an idle server holds no memory. The job needs no `RunAtLoad` or `KeepAlive`, and a `Sockets` entry such as
+  `<key>Sockets</key><dict><key>NAME</key><dict><key>SockNodeName</key><string>127.0.0.1</string>
+  <key>SockServiceName</key><string>8000</string><key>SockFamily</key><string>IPv4</string></dict></dict>`.
 - **An engine that says nothing:** the server ends the engine after `"engine_silence_s"` (default 300) seconds
   without a line from it during a request, and the next request starts it again. An engine that is silent and has
   also used no CPU time and moved no disk bytes for 90 s is ended sooner (`STRATA_ENGINE_STALL_S` sets it, `0` turns

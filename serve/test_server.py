@@ -3503,6 +3503,38 @@ class SharingTheGpu(unittest.TestCase):
         self.assertFalse(self.engine.alive())
         self.assertEqual(self.chat()[0], 200)
 
+    def test_idle_exit(self):
+        self.assertFalse(self.svc.idle_for_exit())                  # off by default
+        self.svc.idle_exit_s = 1
+        self.svc.last_request_at = time.time()
+        self.assertFalse(self.svc.idle_for_exit())                  # a request just now
+        with self.svc.fifo:
+            self.svc.last_request_at = time.time() - 5
+            self.assertFalse(self.svc.idle_for_exit())              # one is running
+        stopped = threading.Event()
+        self.svc.start_idle_exit(stop=stopped.set)
+        self.assertTrue(stopped.wait(10))
+        self.assertTrue(self.svc.idle_for_exit())
+
+    def test_idle_exit_waits_for_a_new_request(self):
+        self.svc.idle_exit_s = 1
+        self.svc.last_request_at = time.time() - 5
+        self.assertEqual(self.chat()[0], 200)                       # counts as activity
+        self.assertFalse(self.svc.idle_for_exit())
+
+    def test_serve_an_open_socket(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(8)
+        httpd = serve(self.svc, sock=sock)                          # what --launchd-socket hands over
+        try:
+            self.assertEqual(httpd.server_address, sock.getsockname())
+            self.base = f"http://127.0.0.1:{sock.getsockname()[1]}"
+            self.assertEqual(self.chat()[0], 200)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
     def test_min_free_vram_refuses_to_load(self):
         self.svc.min_free_vram_mib = 8000
         self.svc.free_vram_mib = lambda: 2000

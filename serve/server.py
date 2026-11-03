@@ -3095,6 +3095,7 @@ class Service:
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
         self.idle_unload_s = 0
+        self.idle_exit_s = 0                            # stop the whole process after this long idle
         self.min_free_vram_mib = 0
         self.before_load = None
         self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
@@ -3551,6 +3552,35 @@ class Service:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def idle_for_exit(self) -> bool:
+        """True when nothing is running or waiting and no request came for idle_exit_s seconds (since the start when
+        none came at all).  The FIFO is held for the check, so a request that is starting counts as activity."""
+        if not self.idle_exit_s or not self.fifo.acquire(blocking=False):
+            return False
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    return False
+            return time.time() - (self.last_request_at or self.started_at) >= self.idle_exit_s
+        finally:
+            self.fifo.release()
+
+    def start_idle_exit(self, stop=None):
+        """Stop the server process after idle_exit_s without requests (stop(): the clean Ctrl+C path).  Meant for a
+        server that launchd starts on demand (--launchd-socket): the next connection starts it again, so an idle
+        server holds no memory at all."""
+        if not self.idle_exit_s:
+            return
+        print(f"[strata] the server stops after {self.idle_exit_s:g} s without requests", flush=True)
+        stop = stop or (lambda: os.kill(os.getpid(), signal.SIGTERM))
+
+        def loop():
+            while not self.idle_for_exit():
+                time.sleep(max(0.5, min(30.0, self.idle_exit_s / 4)))
+            print(f"[strata] no requests for {self.idle_exit_s:g} s: stopping the server", flush=True)
+            stop()
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -6573,10 +6603,38 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
     return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
 
 
-def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+def launchd_socket(name: str) -> socket.socket:
+    """macOS: the listening socket launchd opened for this job's Sockets entry `name` (launch_activate_socket).
+    launchd keeps listening while the server is stopped and starts it at the next connection."""
+    if sys.platform != "darwin":
+        raise SystemExit("[strata] --launchd-socket works on macOS only")
+    libc = ctypes.CDLL(None)
+    fn = libc.launch_activate_socket
+    fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_int)), ctypes.POINTER(ctypes.c_size_t)]
+    fds, n = ctypes.POINTER(ctypes.c_int)(), ctypes.c_size_t(0)
+    err = fn(name.encode(), ctypes.byref(fds), ctypes.byref(n))
+    if err:
+        raise SystemExit(f"[strata] no launchd socket \"{name}\": {os.strerror(err)} (is the server started by "
+                         "launchd with a Sockets entry of that name?)")
+    got = [fds[i] for i in range(n.value)]
+    libc.free(fds)
+    for fd in got[1:]:                                  # one listener is served; the plist names one address
+        os.close(fd)
+    if len(got) > 1:
+        print(f"[strata] launchd passed {len(got)} sockets for \"{name}\"; serving the first", flush=True)
+    return socket.socket(fileno=got[0])
+
+
+def serve(svc: Service, host="127.0.0.1", port=8095, sock: socket.socket | None = None) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
-    httpd = Server((host, port), make_handler(svc))
+    if sock is None:
+        httpd = Server((host, port), make_handler(svc))
+    else:                                               # a socket that already listens (launchd's)
+        httpd = Server((host, port), make_handler(svc), bind_and_activate=False)
+        httpd.socket.close()
+        httpd.socket = sock
+        httpd.server_address = sock.getsockname()[:2]
     httpd.svc = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -6870,6 +6928,13 @@ def main() -> int:
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
                          "in the config; default: never)")
+    ap.add_argument("--idle-exit", type=float, default=None, metavar="SECONDS",
+                    help="stop the whole server after this many seconds without requests (also \"idle_exit_s\" in "
+                         "the config; default: never). With --launchd-socket the next connection starts it again")
+    ap.add_argument("--launchd-socket", default=None, metavar="NAME",
+                    help="macOS: serve the listening socket of the launchd job's Sockets entry NAME instead of "
+                         "binding --host/--port (also \"launchd_socket\" in the config); launchd then starts the "
+                         "server on the first connection")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503 (also "
                          "\"min_free_vram_mib\" in the config; default: always load)")
@@ -6891,7 +6956,8 @@ def main() -> int:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = "127.0.0.1"   # local build: this machine only, whatever the flags or config say   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
+        if not (a.launchd_socket or cfg.get("launchd_socket")):   # launchd's socket holds the port: no check
+            Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
@@ -7053,6 +7119,7 @@ def main() -> int:
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.idle_exit_s = a.idle_exit if a.idle_exit is not None else float(cfg.get("idle_exit_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     if a.before_load or cfg.get("before_load"):   # local build: no commands run before a load
@@ -7150,10 +7217,15 @@ def main() -> int:
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
-    httpd = serve(svc, host=a.host, port=a.port)
+    sock_name = a.launchd_socket or cfg.get("launchd_socket")
+    httpd = serve(svc, host=a.host, port=a.port, **({"sock": launchd_socket(sock_name)} if sock_name else {}))
+    if sock_name:
+        print(f"[strata] serving launchd's socket \"{sock_name}\" ({':'.join(map(str, httpd.server_address))})",
+              flush=True)
     if svc.preload_starts and svc.preload_path and svc.loaded():
         threading.Thread(target=svc.preload_saved_starts, daemon=True).start()
     svc.start_idle_unload()
+    svc.start_idle_exit()
     svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
