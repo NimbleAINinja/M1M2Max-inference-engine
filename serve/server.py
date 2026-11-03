@@ -3107,6 +3107,8 @@ class Service:
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_budget_by_effort = {}             # {"low": N, "medium": N}: a lower budget at those levels
+        self._effort_ids = {}                            # each level's effort sentence as ids, encoded on first use
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
@@ -3228,6 +3230,19 @@ class Service:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         return value if value > 0 else None
+
+    def prompt_effort(self, ids) -> str | None:
+        """The effort level of reasoning_budget_by_effort that the prompt asks for, or None: effort_end puts the level's
+        sentence in a system turn just before the answer, so it is looked for in the prompt's last tokens only (every
+        API's effort field ends there)."""
+        for level in self.reasoning_budget_by_effort:
+            if level not in self._effort_ids:
+                self._effort_ids[level] = self.tok.encode(EFFORT_TEXT[level], parse_special=False)
+            want = self._effort_ids[level]
+            tail = ids[-(len(want) + 64):]
+            if any(tail[i:i + len(want)] == want for i in range(len(tail) - len(want) + 1)):
+                return level
+        return None
 
     def _vision_down(self) -> bool:
         """The encoder should run and does not (the engine's load starts it again).  An elastic encoder is down
@@ -4161,6 +4176,13 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        level = (self.prompt_effort(ids) if thinking and self.reasoning_budget_by_effort
+                 and (sampling or {}).get("reasoning_budget_tokens") is None else None)
+        if level:
+            # a request's own budget wins; otherwise this level thinks at most its reasoning_budget_by_effort budget
+            cap = self.reasoning_budget_by_effort[level]
+            budget = min(budget, cap) if budget else cap
+            print(f"[strata] {level} effort: thinking budget {budget} tokens (reasoning_budget_by_effort)", flush=True)
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
             # it has no answer.  Close the thinking early enough to leave room for one.
@@ -7088,6 +7110,14 @@ def main() -> int:
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
+    by_effort = cfg.get("reasoning_budget_by_effort") or {}   # {"low": N, "medium": N}: lower budgets at those levels
+    if not isinstance(by_effort, dict) or any(k not in ("low", "medium") or isinstance(v, bool) or not isinstance(v, int)
+                                              or v <= 0 for k, v in by_effort.items()):
+        raise SystemExit("[strata] config \"reasoning_budget_by_effort\" must map \"low\" and/or \"medium\" to a "
+                         f"positive whole number of tokens, not {by_effort!r}")
+    svc.reasoning_budget_by_effort = dict(by_effort)
+    for level, n in by_effort.items():
+        print(f"[strata] thinking budget at {level} effort: {n} tokens (reasoning_budget_by_effort)", flush=True)
     recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
     if recovery is True:
         recovery = "recover"

@@ -89,6 +89,9 @@ More thinking keys, all off by default:
 - `"reasoning_loop_recovery": "stop" | "recover"`: a reply whose reasoning repeats whole passages is ended, or
   continued once with the low-effort instruction in place of the default one. A policy, not a guarantee of an
   answer; it can mistake repeated useful code for a loop.
+- `"reasoning_budget_by_effort": {"low": N, "medium": N}`: a lower thinking budget at those levels, in place of
+  `reasoning_budget_tokens` (high keeps it). The level is read from its instruction at the end of the prompt, so it
+  needs `"effort_position": "end"`. A request's own `reasoning_budget_tokens` wins.
 - `"anthropic_thinking": "on_request"`: a `/v1/messages` request with no `"thinking"`, effort or budget is
   rendered without thinking (Anthropic's own rule, and what Claude Code's short helper calls need).
 
