@@ -268,6 +268,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
+  // the cards and bars this machine cannot fill (a Mac: no VRAM, PCIe or expert cache; temperature and power need root)
+  const off = new Set(st.unavailable || []);
+  for (const m of METRICS) { const v = $(`mv-${m.key}`); if (v) v.closest(".metric-card").hidden = off.has(m.key); }
+  for (const [key, id] of [["experts", "slots-text"], ["temp", "temp-text"]]) {
+    const row = $(id).closest(".bar-row");
+    row.hidden = row.nextElementSibling.hidden = off.has(key);
+  }
+
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",

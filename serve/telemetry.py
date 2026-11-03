@@ -3,7 +3,8 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.
+  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.  On a Mac: ioreg's IOAccelerator
+  statistics - load only (temperature and power need root; memory is unified, so RAM covers it).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -14,6 +15,8 @@ import collections
 import ctypes
 import os
 import platform
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -246,8 +249,58 @@ class _Amd:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ Apple (macOS ioreg)
+APPLE_UTIL = re.compile(r'"Device Utilization %"\s*=\s*(\d+)')
+
+
+def apple_gpu_util(text):
+    """The GPU load in percent from `ioreg -r -d 1 -c IOAccelerator` output, or None when it has none."""
+    m = APPLE_UTIL.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def _sysctl(name):
+    """One sysctl value as text, or None."""
+    try:
+        r = subprocess.run(["/usr/sbin/sysctl", "-n", name], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+class _AppleGpu:
+    """Apple silicon's GPU load from the IOAccelerator's performance statistics (ioreg, no root needed).  Temperature
+    and power need root (powermetrics) and there is no PCIe link.  Memory is unified, and the driver's "in use" figure
+    leaves out the model file the engine maps in place, so only the load is read."""
+
+    def __init__(self, index=0):
+        self._ok = sys.platform == "darwin" and self._util() is not None
+
+    @staticmethod
+    def _util():
+        try:
+            r = subprocess.run(["/usr/sbin/ioreg", "-r", "-d", "1", "-c", "IOAccelerator"], capture_output=True,
+                               text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return apple_gpu_util(r.stdout) if r.returncode == 0 else None
+
+    def ok(self):
+        return self._ok
+
+    def name(self):
+        return _sysctl("machdep.cpu.brand_string")
+
+    def read(self):
+        return {"util": self._util()}
+
+
 def gpu_reader(index=0, amd=False):
-    """The card's readings: NVML (NVIDIA), or the amdgpu sysfs files with the AMD backend (#301)."""
+    """The card's readings: NVML (NVIDIA), the amdgpu sysfs files with the AMD backend (#301), or ioreg on a Mac."""
+    if sys.platform == "darwin" and not amd:
+        return _AppleGpu(index)
     return _Amd(index) if amd else _Nvml(index)
 
 
@@ -332,6 +385,10 @@ def _cpu_name():
         for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
+    elif sys.platform == "darwin":
+        name = _sysctl("machdep.cpu.brand_string")   # platform.processor() only says "arm"
+        if name:
+            return name
     return platform.processor() or None
 
 
@@ -426,6 +483,10 @@ class Telemetry:
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
             "psutil": self.ps is not None,
+            # the Monitor's cards this machine cannot fill: on a Mac there is no VRAM, PCIe or expert cache to show,
+            # and the GPU's temperature and power need root
+            "unavailable": (["vram", "temp", "power", "pcie", "experts"]
+                            if isinstance(self.gpu, _AppleGpu) and self.gpu.ok() else []),
         }
         self._disk_prev = None
         self._stop = threading.Event()

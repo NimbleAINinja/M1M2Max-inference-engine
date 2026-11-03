@@ -31,3 +31,6 @@ pyyaml==6.0.3 --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e1
 
 # Regex engine the tokenizer (tools/strata_tokenizer.py) uses for its pre-tokenizer split.
 regex==2026.9.10 --hash=sha256:1e321e2c84f0e52c457f5ea5944f796d6e8e09cb99738ea98dcc1bfe402a128d
+
+# CPU, RAM and disk readings for the web app's Monitor tab (serve/telemetry.py).
+psutil==7.2.2 --hash=sha256:0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372

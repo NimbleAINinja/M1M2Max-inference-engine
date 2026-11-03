@@ -4540,6 +4540,48 @@ class TelemetryNoDisks(unittest.TestCase):
                 t.close()
 
 
+class AppleTelemetry(unittest.TestCase):
+    """On a Mac the GPU load comes from ioreg, and the Monitor is told which cards it cannot fill (no VRAM, PCIe or
+    expert cache; temperature and power need root), so the page hides them instead of showing dashes."""
+    IOREG = '"PerformanceStatistics" = {"Tiler Utilization %"=24,"Device Utilization %"=42,"In use system memory"=9}'
+
+    def fake_run(self, args, **kwargs):
+        out = self.IOREG if args[0].endswith("ioreg") else "Apple M1 Max\n"
+        return SimpleNamespace(returncode=0, stdout=out)
+
+    def test_parse(self):
+        from serve import telemetry
+        self.assertEqual(telemetry.apple_gpu_util(self.IOREG), 42)
+        self.assertIsNone(telemetry.apple_gpu_util('"Tiler Utilization %"=24'))
+        self.assertIsNone(telemetry.apple_gpu_util(None))
+
+    def test_mac_reader_and_unavailable_cards(self):
+        from serve import telemetry
+        with mock.patch.object(telemetry.sys, "platform", "darwin"), \
+                mock.patch.object(telemetry.subprocess, "run", side_effect=self.fake_run):
+            g = telemetry.gpu_reader(0)
+            self.assertTrue(g.ok())
+            self.assertEqual(g.name(), "Apple M1 Max")
+            self.assertEqual(g.read(), {"util": 42})
+            t = telemetry.Telemetry()
+            try:
+                self.assertEqual(t.static["gpu_name"], "Apple M1 Max")
+                self.assertEqual(set(t.static["unavailable"]), {"vram", "temp", "power", "pcie", "experts"})
+                self.assertEqual(t.sample()["gpu_util"], 42)
+            finally:
+                t.close()
+
+    def test_other_systems_keep_their_readers(self):
+        from serve import telemetry
+        with mock.patch.object(telemetry.sys, "platform", "linux"):
+            self.assertNotIsInstance(telemetry.gpu_reader(0), telemetry._AppleGpu)
+            t = telemetry.Telemetry()
+            try:
+                self.assertEqual(t.static["unavailable"], [])
+            finally:
+                t.close()
+
+
 class SilentEngine(unittest.TestCase):
     """#481: an engine that prints nothing for engine_silence_s during a request (or never acknowledges a STOP) has
     lost step with the server: it is ended and the request fails with EngineDied, instead of waiting forever."""
